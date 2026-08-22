@@ -113,7 +113,7 @@ func startRecording() {
         fputs("❌ Failed to start audio engine: \(error)\n", stderr)
         return
     }
-    recordStart = CFAbsoluteTimeGetCurrent()
+    withStateLock { recordStart = CFAbsoluteTimeGetCurrent() }
     startIndicator()
 }
 
@@ -124,8 +124,7 @@ func stopRecordingSync() -> [Float]? {
     let eng: AVAudioEngine? = withStateLock {
         guard isRecording else { return nil }
         isRecording = false
-        acceptingAudio = false
-        isTranscribing = true
+        acceptingAudio = false   // isTranscribing is owned by the transcribe path
         let e = engine
         engine = nil
         return e
@@ -142,6 +141,7 @@ func stopRecordingSync() -> [Float]? {
 }
 
 func transcribe(_ samples: [Float], discard: Bool) async {
+    // Caller sets isTranscribing when spawning us; we always clear it on exit.
     defer { withStateLock { isTranscribing = false } }
     guard !discard, samples.count > SAMPLE_RATE / 2 else { return }   // min half second
 
@@ -184,11 +184,12 @@ let callback: CGEventTapCallBack = { _, _, event, _ in
             if withStateLock({ isRecording }) {
                 let discard = event.flags.contains(.maskControl)
                 if let samples = stopRecordingSync() {
+                    let elapsed = withStateLock { CFAbsoluteTimeGetCurrent() - recordStart }
                     // Quick re-tap: not speech, just someone typing §. Emit the symbol.
-                    if !discard && CFAbsoluteTimeGetCurrent() - recordStart < DOUBLE_TAP_WINDOW {
-                        withStateLock { isTranscribing = false }   // no transcription will run to clear it
+                    if !discard && elapsed < DOUBLE_TAP_WINDOW {
                         DispatchQueue.main.async { typeText("§") }
                     } else {
+                        withStateLock { isTranscribing = true }   // cleared by transcribe()'s defer
                         Task { await transcribe(samples, discard: discard) }
                     }
                 }
