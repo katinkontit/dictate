@@ -23,6 +23,7 @@ var isRecording = false
 var isTranscribing = false
 var acceptingAudio = false
 var fnWasDown = false
+var modelsReady = false
 
 // -------- Recording indicator --------
 var statusItem: NSStatusItem!
@@ -65,7 +66,7 @@ func typeText(_ text: String) {
 // -------- Recording --------
 func startRecording() {
     let canStart = withStateLock { () -> Bool in
-        if isRecording || isTranscribing { return false }
+        if isRecording || isTranscribing || !modelsReady { return false }
         isRecording = true
         acceptingAudio = true
         buffer.removeAll(keepingCapacity: true)
@@ -98,7 +99,17 @@ func startRecording() {
     }
 
     withStateLock { engine = eng }
-    try! eng.start()
+    do {
+        try eng.start()
+    } catch {
+        withStateLock {
+            engine = nil
+            isRecording = false
+            acceptingAudio = false
+        }
+        fputs("❌ Failed to start audio engine: \(error)\n", stderr)
+        return
+    }
     startIndicator()
 }
 
@@ -130,28 +141,27 @@ func transcribe(_ samples: [Float], discard: Bool) async {
     defer { withStateLock { isTranscribing = false } }
     guard !discard, samples.count > SAMPLE_RATE / 3 else { return }
 
-    var decoderState = try! TdtDecoderState()
-    let result = try! await asr.transcribe(samples, decoderState: &decoderState)
-    if !result.text.isEmpty {
-        await MainActor.run { typeText(result.text + " ") }
+    do {
+        var decoderState = try TdtDecoderState()
+        let result = try await asr.transcribe(samples, decoderState: &decoderState)
+        if !result.text.isEmpty {
+            await MainActor.run { typeText(result.text + " ") }
+        }
+    } catch {
+        fputs("❌ Transcription failed: \(error)\n", stderr)
+        DispatchQueue.main.async { statusItem.button?.title = "✧" }
     }
 }
 
 // -------- Setup --------
-asr = AsrManager(config: .default)
+let asr = AsrManager(config: .default)
 
-// Load models off-thread; main thread waits, then sets up the tap synchronously.
-// (An unstructured top-level Task would let the process exit before setup runs.)
-let modelsLoaded = DispatchSemaphore(value: 0)
-Task.detached {
-    try! await asr.loadModels(AsrModels.downloadAndLoad(version: .v3))  // ~480 MB download on first run only
-    fputs("✅ Model loaded. Tap Fn/Globe to toggle dictation, Ctrl+Fn tap to discard.\n", stderr)
-    modelsLoaded.signal()
-}
-modelsLoaded.wait()
-
+// Set up the status item and event tap on the main thread immediately; the run
+// loop starts right away and model loading proceeds off-thread. Recording is
+// gated on `modelsReady`, so nothing blocks and no main-thread wait can deadlock
+// if FluidAudio (or URLSession) ever hops to the main queue during load.
 statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-statusItem.button?.title = "✧"
+statusItem.button?.title = "⏳"   // loading
 
 let callback: CGEventTapCallBack = { _, _, event, _ in
     let kc = event.getIntegerValueField(.keyboardEventKeycode)
@@ -182,5 +192,18 @@ guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEve
 let src = CFMachPortCreateRunLoopSource(nil, tap, 0)
 CFRunLoopAddSource(CFRunLoopGetMain(), src, .defaultMode)
 CGEvent.tapEnable(tap: tap, enable: true)
+
+Task.detached {
+    do {
+        try await asr.loadModels(AsrModels.downloadAndLoad(version: .v3))  // ~480 MB download on first run only
+        withStateLock { modelsReady = true }
+        await MainActor.run { statusItem.button?.title = "✧" }
+        fputs("✅ Model loaded. Tap Fn/Globe to toggle dictation, Ctrl+Fn tap to discard.\n", stderr)
+    } catch {
+        fputs("❌ Failed to load ASR models: \(error)\n", stderr)
+        await MainActor.run { statusItem.button?.title = "✕" }
+        exit(1)
+    }
+}
 
 RunLoop.main.run()   // never returns; services the event-tap Mach port source
