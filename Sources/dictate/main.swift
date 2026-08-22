@@ -227,4 +227,16 @@ Task.detached {
     }
 }
 
+// macOS disables an event tap if its callback stalls or Secure Input takes over
+// (and it stays disabled afterward). Watch for that and re-enable.
+let tapWatchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+tapWatchdog.schedule(deadline: .now() + 10, repeating: 10)
+tapWatchdog.setEventHandler {
+    if !CGEvent.tapIsEnabled(tap: tap) {
+        fputs("⚠️  Event tap was disabled (Secure Input?); re-enabling.\n", stderr)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+}
+tapWatchdog.resume()
+
 RunLoop.main.run()   // never returns; services the event-tap Mach port source
