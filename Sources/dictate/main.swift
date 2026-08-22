@@ -4,8 +4,9 @@ import CoreGraphics
 import FluidAudio
 
 // dictate — offline push-to-talk dictation for macOS.
-// Tap Fn/Globe to start recording, tap again to transcribe at the cursor.
-// Ctrl+Fn discards. Indicator: ✦ blinks in the menu bar while recording.
+// Tap § to start recording, tap again to transcribe at the cursor.
+// Double-tap § types a literal §; Ctrl+§ discards.
+// Indicator: ✦ blinks in the menu bar while recording.
 
 let SAMPLE_RATE = 16000
 
@@ -22,8 +23,10 @@ var engine: AVAudioEngine?
 var isRecording = false
 var isTranscribing = false
 var acceptingAudio = false
-var fnWasDown = false
 var modelsReady = false
+var recordStart = TimeInterval(0)
+var keyWasUp = true   // edge detection for the hotkey
+let DOUBLE_TAP_WINDOW = 0.5   // clip shorter than this = double-tap, type a literal §
 
 // -------- Recording indicator --------
 var statusItem: NSStatusItem!
@@ -110,10 +113,11 @@ func startRecording() {
         fputs("❌ Failed to start audio engine: \(error)\n", stderr)
         return
     }
+    recordStart = CFAbsoluteTimeGetCurrent()
     startIndicator()
 }
 
-// Synchronous stop so a quick Fn re-press between utterances is never dropped.
+// Synchronous stop so a quick § re-press between utterances is never dropped.
 func stopRecordingSync() -> [Float]? {
     stopIndicator()
 
@@ -139,7 +143,7 @@ func stopRecordingSync() -> [Float]? {
 
 func transcribe(_ samples: [Float], discard: Bool) async {
     defer { withStateLock { isTranscribing = false } }
-    guard !discard, samples.count > SAMPLE_RATE / 3 else { return }
+    guard !discard, samples.count > SAMPLE_RATE / 2 else { return }   // min half second
 
     do {
         var decoderState = try TdtDecoderState()
@@ -163,28 +167,45 @@ let asr = AsrManager(config: .default)
 statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 statusItem.button?.title = "⏳"   // loading
 
+let HOTKEY = Int64(10)   // § (kVK_ISO_Section; the ANSI grave key is 50)
+let debugKeys = ProcessInfo.processInfo.environment["DICTATE_DEBUG"] != nil
+
 let callback: CGEventTapCallBack = { _, _, event, _ in
     let kc = event.getIntegerValueField(.keyboardEventKeycode)
-    if kc == 63 || kc == 179 {
-        let fnDown = event.flags.contains(.maskSecondaryFn)
-        if fnDown && !fnWasDown {                       // act on the DOWN edge only
+    if debugKeys { fputs("[debug] type=\(event.type) kc=\(kc)\n", stderr) }
+    // Claim the key only for bare § and Ctrl+§; Shift+§ (°), Option+§, etc. pass through untouched.
+    let f = event.flags
+    let otherModifiers = f.contains(.maskShift) || f.contains(.maskAlternate) ||
+                         f.contains(.maskCommand) || f.contains(.maskSecondaryFn)
+    if kc == HOTKEY && !otherModifiers {
+        // § produces keyDown/keyUp events rather than flagsChanged; act on the DOWN edge only.
+        let isDown = event.type == .keyDown
+        if isDown && keyWasUp {
             if withStateLock({ isRecording }) {
                 let discard = event.flags.contains(.maskControl)
                 if let samples = stopRecordingSync() {
-                    Task { await transcribe(samples, discard: discard) }
+                    // Quick re-tap: not speech, just someone typing §. Emit the symbol.
+                    if !discard && CFAbsoluteTimeGetCurrent() - recordStart < DOUBLE_TAP_WINDOW {
+                        withStateLock { isTranscribing = false }   // no transcription will run to clear it
+                        DispatchQueue.main.async { typeText("§") }
+                    } else {
+                        Task { await transcribe(samples, discard: discard) }
+                    }
                 }
             } else {
                 startRecording()
             }
         }
-        withStateLock { fnWasDown = fnDown }
+        withStateLock { keyWasUp = !isDown }
+        return nil   // swallow the hotkey so § never reaches the target app
     }
     return Unmanaged.passUnretained(event)
 }
 
 guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                  options: .listenOnly,
-                                  eventsOfInterest: 1 << CGEventType.flagsChanged.rawValue,
+                                  options: .defaultTap,   // filter, not just listen: we swallow §
+                                  eventsOfInterest: (1 << CGEventType.keyDown.rawValue) |
+                                                    (1 << CGEventType.keyUp.rawValue),
                                   callback: callback, userInfo: nil) else {
     fputs("❌ Failed to create event tap. Grant Accessibility permission.\n", stderr)
     exit(1)
@@ -198,7 +219,7 @@ Task.detached {
         try await asr.loadModels(AsrModels.downloadAndLoad(version: .v3))  // ~480 MB download on first run only
         withStateLock { modelsReady = true }
         await MainActor.run { statusItem.button?.title = "✧" }
-        fputs("✅ Model loaded. Tap Fn/Globe to toggle dictation, Ctrl+Fn tap to discard.\n", stderr)
+        fputs("✅ Model loaded. Tap § to toggle dictation, double-tap to type §, Ctrl+§ discards.\n", stderr)
     } catch {
         fputs("❌ Failed to load ASR models: \(error)\n", stderr)
         await MainActor.run { statusItem.button?.title = "✕" }
