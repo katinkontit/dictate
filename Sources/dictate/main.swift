@@ -152,8 +152,8 @@ func transcribe(_ samples: [Float], discard: Bool) async {
             await MainActor.run { typeText(result.text + " ") }
         }
     } catch {
+        // Indicator already reset by stopRecordingSync(); nothing else to do.
         fputs("❌ Transcription failed: \(error)\n", stderr)
-        DispatchQueue.main.async { statusItem.button?.title = "✧" }
     }
 }
 

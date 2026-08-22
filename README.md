@@ -27,9 +27,7 @@ Security): **Microphone**, **Accessibility**, **Input Monitoring**.
 ## Uninstall
 
 ```bash
-launchctl bootout gui/$(id -u)/com.user.dictate
-rm ~/Library/LaunchAgents/com.user.dictate.plist /usr/local/bin/dictate
-rm -rf ~/Library/Application\ Support/FluidAudio   # model cache
+./install.sh uninstall
 ```
 
 ## Notes
