@@ -121,7 +121,7 @@ func stopRecordingSync() -> [Float]? {
 
     return withStateLock {
         let s = buffer
-        buffer.removeAll(keepingCapacity: true)
+        buffer.removeAll(keepingCapacity: false)   // release the audio back to the OS
         return s
     }
 }
