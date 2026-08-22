@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 # ---- every filesystem location, in one place -------------------------------
 BIN=/usr/local/bin/dictate                            # binary
 PLIST="$HOME/Library/LaunchAgents/com.user.dictate.plist"
-LOG="$HOME/Library/Logs/dictate.log"                  # stderr log
+LOG=/tmp/dictate.log                                 # stderr (system cleans /tmp periodically)
 CACHE="$HOME/Library/Application Support/FluidAudio"  # ~480 MB model cache
 LABEL=com.user.dictate
 
@@ -33,7 +33,7 @@ install)
     sudo cp .build/release/dictate "$BIN"
 
     echo "==> Installing LaunchAgent..."
-    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+    mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
