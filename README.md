@@ -2,7 +2,7 @@
 
 One binary, one dependency. Tap § → speak → tap again → text at your cursor.
 Local transcription with Parakeet TDT v3 (0.6B) on Apple Silicon via Core ML
-([FluidAudio](https://github.com/FluidInference/FluidAudio)). No cloud, no Python.
+([FluidAudio](https://github.com/FluidInference/FluidAudio))
 
 - **Tap-toggle**: § tap starts recording (✦ blinks in menu bar), second tap transcribes.
 - **Double-tap §** (<0.5 s between taps) types a literal `§` instead — the key stays usable for writing.
@@ -38,5 +38,4 @@ Security): **Microphone**, **Accessibility**, **Input Monitoring**.
 - Utterances shorter than half a second are ignored.
 - FluidAudio is pinned via `Package.resolved` — don't delete it.
 - Audio buffer is unbounded; dictate per utterance.
-- Debug key events: `DICTATE_DEBUG=1 .build/release/dictate`.
 - Works as a plain CLI too: `swift build -c release && .build/release/dictate`.
