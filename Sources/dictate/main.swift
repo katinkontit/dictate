@@ -19,12 +19,10 @@ func withStateLock<T>(_ body: () -> T) -> T {
 
 // Shared state (all access under stateLock unless noted)
 var buffer: [Float] = []
-var engine: AVAudioEngine?
 var isRecording = false
 var isTranscribing = false
-var acceptingAudio = false
 var modelsReady = false
-var recordStart = TimeInterval(0)
+var runningSession: (engine: AVAudioEngine, observer: NSObjectProtocol)?  // now paired
 var keyWasUp = true   // edge detection for the hotkey
 let DOUBLE_TAP_WINDOW = 0.5   // clip shorter than this = double-tap, type a literal §
 
@@ -67,17 +65,10 @@ func typeText(_ text: String) {
 }
 
 // -------- Recording --------
-func startRecording() {
-    let canStart = withStateLock { () -> Bool in
-        if isRecording || isTranscribing || !modelsReady { return false }
-        isRecording = true
-        acceptingAudio = true
-        buffer.removeAll(keepingCapacity: true)
-        return true
-    }
-    guard canStart else { return }
 
-    let eng = AVAudioEngine()
+// Installs the tap using the input node's CURRENT native format. Called at
+// record start and again on .AVAudioEngineConfigurationChange.
+func installTap(on eng: AVAudioEngine) {
     let hw = eng.inputNode.outputFormat(forBus: 0)
     let target = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                sampleRate: Double(SAMPLE_RATE), channels: 1, interleaved: false)!
@@ -88,7 +79,7 @@ func startRecording() {
         guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
         var fed = false
         conv.convert(to: out, error: nil) { _, status in
-            if fed { status.pointee = .noDataNow; return nil }   // never feed the same buffer twice
+            if fed { status.pointee = .noDataNow; return nil }
             fed = true
             status.pointee = .haveData
             return buf
@@ -97,53 +88,80 @@ func startRecording() {
         guard frames > 0 else { return }
         let samples = Array(UnsafeBufferPointer(start: out.floatChannelData![0], count: frames))
         withStateLock {
-            if acceptingAudio { buffer.append(contentsOf: samples) }   // unbounded by design
+            if isRecording { buffer.append(contentsOf: samples) }   // accept audio only while recording
         }
     }
+}
 
-    withStateLock { engine = eng }
+func startRecording() -> TimeInterval? {
+    let canStart = withStateLock { () -> Bool in
+        if isRecording || isTranscribing || !modelsReady { return false }
+        isRecording = true
+        buffer.removeAll(keepingCapacity: true)
+        return true
+    }
+    guard canStart else { return nil }
+
+    let eng = AVAudioEngine()
+    installTap(on: eng)
+
+    let obs = NotificationCenter.default.addObserver(
+        forName: .AVAudioEngineConfigurationChange, object: eng, queue: .main
+    ) { _ in
+        guard withStateLock({ runningSession?.engine === eng && isRecording }) else { return }
+        eng.inputNode.removeTap(onBus: 0)
+        installTap(on: eng)
+        if !eng.isRunning { try? eng.start() }
+    }
+
     do {
         try eng.start()
     } catch {
         withStateLock {
-            engine = nil
+            NotificationCenter.default.removeObserver(obs)
+            runningSession = nil
             isRecording = false
-            acceptingAudio = false
         }
         fputs("❌ Failed to start audio engine: \(error)\n", stderr)
-        return
+        return nil
     }
-    withStateLock { recordStart = CFAbsoluteTimeGetCurrent() }
+
+    let startTime = CFAbsoluteTimeGetCurrent()
+    withStateLock {
+        runningSession = (eng, obs)
+    }
     startIndicator()
+    return startTime
 }
 
-// Synchronous stop so a quick § re-press between utterances is never dropped.
+// Synchronous stop – returns the captured audio buffer.
 func stopRecordingSync() -> [Float]? {
     stopIndicator()
 
-    let eng: AVAudioEngine? = withStateLock {
+    let session: (engine: AVAudioEngine, observer: NSObjectProtocol)? = withStateLock {
         guard isRecording else { return nil }
         isRecording = false
-        acceptingAudio = false   // isTranscribing is owned by the transcribe path
-        let e = engine
-        engine = nil
-        return e
+        let s = runningSession
+        runningSession = nil
+        return s
     }
 
-    eng?.stop()
-    eng?.inputNode.removeTap(onBus: 0)
+    if let (eng, obs) = session {
+        NotificationCenter.default.removeObserver(obs)
+        eng.stop()
+        eng.inputNode.removeTap(onBus: 0)
+    }
 
     return withStateLock {
         let s = buffer
-        buffer.removeAll(keepingCapacity: false)   // release the audio back to the OS
+        buffer.removeAll(keepingCapacity: false)
         return s
     }
 }
 
 func transcribe(_ samples: [Float], discard: Bool) async {
-    // Caller sets isTranscribing when spawning us; we always clear it on exit.
     defer { withStateLock { isTranscribing = false } }
-    guard !discard, samples.count > SAMPLE_RATE / 2 else { return }   // min half second
+    guard !discard, samples.count > SAMPLE_RATE / 2 else { return }
 
     do {
         var decoderState = try TdtDecoderState()
@@ -152,7 +170,6 @@ func transcribe(_ samples: [Float], discard: Bool) async {
             await MainActor.run { typeText(result.text + " ") }
         }
     } catch {
-        // Indicator already reset by stopRecordingSync(); nothing else to do.
         fputs("❌ Transcription failed: \(error)\n", stderr)
     }
 }
@@ -160,51 +177,48 @@ func transcribe(_ samples: [Float], discard: Bool) async {
 // -------- Setup --------
 let asr = AsrManager(config: .default)
 
-// Set up the status item and event tap on the main thread immediately; the run
-// loop starts right away and model loading proceeds off-thread. Recording is
-// gated on `modelsReady`, so nothing blocks and no main-thread wait can deadlock
-// if FluidAudio (or URLSession) ever hops to the main queue during load.
 statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 statusItem.button?.title = "⏳"   // loading
 
-let HOTKEY = Int64(10)   // § (kVK_ISO_Section; the ANSI grave key is 50)
-let debugKeys = ProcessInfo.processInfo.environment["DICTATE_DEBUG"] != nil
+let HOTKEY = Int64(10)   // § (kVK_ISO_Section)
 
 let callback: CGEventTapCallBack = { _, _, event, _ in
     let kc = event.getIntegerValueField(.keyboardEventKeycode)
-    if debugKeys { fputs("[debug] type=\(event.type) kc=\(kc)\n", stderr) }
-    // Claim the key only for bare § and Ctrl+§; Shift+§ (°), Option+§, etc. pass through untouched.
     let f = event.flags
     let otherModifiers = f.contains(.maskShift) || f.contains(.maskAlternate) ||
                          f.contains(.maskCommand) || f.contains(.maskSecondaryFn)
     if kc == HOTKEY && !otherModifiers {
-        // § produces keyDown/keyUp events rather than flagsChanged; act on the DOWN edge only.
         let isDown = event.type == .keyDown
         if isDown && keyWasUp {
             if withStateLock({ isRecording }) {
                 let discard = event.flags.contains(.maskControl)
                 if let samples = stopRecordingSync() {
-                    let elapsed = withStateLock { CFAbsoluteTimeGetCurrent() - recordStart }
-                    // Quick re-tap: not speech, just someone typing §. Emit the symbol.
+                    // Use the start time captured when we began recording
+                    let elapsed = CFAbsoluteTimeGetCurrent() - (recordingStartTime ?? 0)
                     if !discard && elapsed < DOUBLE_TAP_WINDOW {
                         DispatchQueue.main.async { typeText("§") }
                     } else {
-                        withStateLock { isTranscribing = true }   // cleared by transcribe()'s defer
+                        withStateLock { isTranscribing = true }
                         Task { await transcribe(samples, discard: discard) }
                     }
                 }
+                recordingStartTime = nil
             } else {
-                startRecording()
+                // Start recording and remember the start time
+                recordingStartTime = startRecording()
             }
         }
         withStateLock { keyWasUp = !isDown }
-        return nil   // swallow the hotkey so § never reaches the target app
+        return nil   // swallow the hotkey
     }
     return Unmanaged.passUnretained(event)
 }
 
+// Local variable to hold the start time – lives inside the callback's closure context
+var recordingStartTime: TimeInterval? = nil
+
 guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                  options: .defaultTap,   // filter, not just listen: we swallow §
+                                  options: .defaultTap,
                                   eventsOfInterest: (1 << CGEventType.keyDown.rawValue) |
                                                     (1 << CGEventType.keyUp.rawValue),
                                   callback: callback, userInfo: nil) else {
@@ -217,7 +231,7 @@ CGEvent.tapEnable(tap: tap, enable: true)
 
 Task.detached {
     do {
-        try await asr.loadModels(AsrModels.downloadAndLoad(version: .v3))  // ~480 MB download on first run only
+        try await asr.loadModels(AsrModels.downloadAndLoad(version: .v3))
         withStateLock { modelsReady = true }
         await MainActor.run { statusItem.button?.title = "✧" }
         fputs("✅ Model loaded. Tap § to toggle dictation, double-tap to type §, Ctrl+§ discards.\n", stderr)
@@ -228,8 +242,7 @@ Task.detached {
     }
 }
 
-// macOS disables an event tap if its callback stalls or Secure Input takes over
-// (and it stays disabled afterward). Watch for that and re-enable.
+// Watchdog: re-enable event tap if disabled (e.g. by Secure Input)
 let tapWatchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
 tapWatchdog.schedule(deadline: .now() + 10, repeating: 10)
 tapWatchdog.setEventHandler {
@@ -240,4 +253,4 @@ tapWatchdog.setEventHandler {
 }
 tapWatchdog.resume()
 
-RunLoop.main.run()   // never returns; services the event-tap Mach port source
+RunLoop.main.run()
